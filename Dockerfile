@@ -32,6 +32,9 @@ RUN conda create -n mmocr python=3.8 && \
     # git checkout 5fb1268a06cd12a3c539a29612be61aabecfd3f8 && \
     # pip install -e .
 
+SHELL ["conda", "run", "-n", "base", "/bin/bash", "-c"]
+RUN conda init bash
+
 COPY ./mmocr_infer.py ./run.sh ./weights /workspace/
 
 # ENTRYPOINT ["/bin/bash", "run.sh"]
