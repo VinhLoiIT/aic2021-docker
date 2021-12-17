@@ -1,39 +1,88 @@
-FROM nvidia/cuda:11.1-cudnn8-devel-ubuntu20.04
-SHELL ["/bin/bash", "-c"]
-
-ENV TZ=Asia/Ho_Chi_Minh
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-
-WORKDIR /workspace
+# syntax = docker/dockerfile:experimental
+#
+# NOTE: To build this you will need a docker version > 18.06 with
+#       experimental enabled and DOCKER_BUILDKIT=1
+#
+#       If you do not use buildkit you are not going to have a good time
+#
+#       For reference:
+#           https://docs.docker.com/develop/develop-images/build_enhancements/
+ARG BASE_IMAGE=ubuntu:18.04
+ARG PYTHON_VERSION=3.8
 
 # Instal basic utilities
-RUN apt-get update && \
-    apt-get install --no-install-recommends -y python3 python3-pip python3-dev git wget unzip bzip2 build-essential \
-        ca-certificates ffmpeg libsm6 libxext6 && \
-    ln -s /usr/bin/python3 /usr/bin/python && \
-    apt-get clean && \
+FROM ${BASE_IMAGE} as dev-base
+RUN --mount=type=cache,id=apt-dev,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        curl \
+        git \
+        gcc \
+        libjpeg-dev \
+        unzip bzip2 ffmpeg libsm6 libxext6 \
+        libpng-dev && \
     rm -rf /var/lib/apt/lists/*
+RUN /usr/sbin/update-ccache-symlinks
+RUN mkdir /opt/ccache && ccache --set-config=cache_dir=/opt/ccache
+ENV PATH /opt/conda/bin:$PATH
 
-# Install pytorch
-RUN pip3 install torch==1.10.0+cu111 -f https://download.pytorch.org/whl/cu111/torch/ && \
-    pip3 install torchvision==0.11.1+cu111 -f https://download.pytorch.org/whl/cu111/torchvision
-
-# # Install mmocr
+FROM dev-base as conda-installs
+ARG PYTHON_VERSION=3.8
+ARG CUDA_VERSION=10.2
+ARG PYTORCH_VERSION=1.10
+ARG CUDA_CHANNEL=nvidia
+ARG INSTALL_CHANNEL=pytorch
+ENV CONDA_OVERRIDE_CUDA=${CUDA_VERSION}
+RUN curl -fsSL -v -o ~/miniconda.sh -O  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  && \
+    chmod +x ~/miniconda.sh && \
+    ~/miniconda.sh -b -p /opt/conda && \
+    rm ~/miniconda.sh && \
+    /opt/conda/bin/conda install -c "${INSTALL_CHANNEL}" -c "${CUDA_CHANNEL}" -y \
+        python=${PYTHON_VERSION} \
+        pytorch=${TORCH_VERSION} torchvision "cudatoolkit=${CUDA_VERSION}" && \
+    /opt/conda/bin/conda install -y paddlepaddle-gpu==2.2.1 -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/Paddle/ && \
+    /opt/conda/bin/conda clean -ya
+RUN /opt/conda/bin/python -m pip install --user mmcv-full==1.3.17 -f https://download.openmmlab.com/mmcv/dist/cu102/torch1.10.0/index.html && \
+    /opt/conda/bin/python -m pip install --user imgaug==0.4.0 mmdet==2.18.1
+# Install mmocr
 COPY mmocr/ /workspace/mmocr/
-RUN pip3 install mmcv-full==1.3.17 -f https://download.openmmlab.com/mmcv/dist/cu111/torch1.10.0/index.html && \
-    pip3 install imgaug==0.4.0 mmdet==2.18.1 && \
-    cd mmocr && \
-    pip3 install -e .
-
-# # Install paddle
+WORKDIR /workspace/mmocr
+RUN /opt/conda/bin/python -m pip install --user .
+# Install paddle
 COPY paddleocr/ /workspace/paddleocr/
-COPY paddlepaddle_gpu-2.2.1.post112-cp38-cp38-linux_x86_64.whl /workspace/
-RUN pip3 install paddlepaddle_gpu-2.2.1.post112-cp38-cp38-linux_x86_64.whl && \
-    rm paddlepaddle_gpu-2.2.1.post112-cp38-cp38-linux_x86_64.whl && \
-    cd paddleocr && \
-    pip3 install scikit-learn editdistance && \
-    pip3 install -r requirements.txt
+WORKDIR /workspace/paddleocr
+RUN /opt/conda/bin/python -m pip install --user -r requirements.txt && \
+    /opt/conda/bin/python -m pip install --user scikit-learn editdistance
 
+
+FROM ${BASE_IMAGE} as official
+SHELL ["/bin/bash", "-c"]
+ENV TZ=Asia/Ho_Chi_Minh
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+WORKDIR /workspace
+ARG PYTORCH_VERSION
+LABEL com.nvidia.volumes.needed="nvidia_driver"
+RUN --mount=type=cache,id=apt-final,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg libsm6 libxext6 \
+        libjpeg-dev \
+        libpng-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=conda-installs /opt/conda /opt/conda
+# copy packages installed by pip
+COPY --from=conda-installs /root/.local /root/.local
+COPY --from=conda-installs /workspace /workspace
+ENV PATH /opt/conda/bin:$PATH
+ENV NVIDIA_VISIBLE_DEVICES all
+ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
+ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV PYTORCH_VERSION ${PYTORCH_VERSION}
+
+WORKDIR /workspace
 COPY weights/ /workspace/weights
 COPY ./mmocr_infer.py ./run.sh ./run_paddle.sh /workspace/
 
